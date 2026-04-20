@@ -99,6 +99,8 @@ if(CONFIG_MODULES_MC_RATE_CONTROL)
 		14001_generic_mc_with_tilt
 
 		16001_helicopter
+		
+		22001_TF-H1
 
 		24001_dodeca_cox
 	)

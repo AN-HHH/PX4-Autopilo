@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# @name TF H1 Bi-rotor (same-spin)
+#
+# @type Generic Multicopter
+# @class Copter
+#
+# @maintainer tfboys <tfboys@local>
+#
+# @output Motor1 right motor
+# @output Motor2 left motor
+#
+
+. ${R}etc/init.d/rc.mc_defaults
+
+param set-default MAV_TYPE 2
+
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 2
+
+param set-default CA_ROTOR0_PX  0.17
+param set-default CA_ROTOR0_PY  0.0
+param set-default CA_ROTOR0_PZ  0.0
+param set-default CA_ROTOR0_KM  0.05
+
+param set-default CA_ROTOR1_PX -0.17
+param set-default CA_ROTOR1_PY  0.0
+param set-default CA_ROTOR1_PZ  0.0
+param set-default CA_ROTOR1_KM  0.05
+
+my_controller start
