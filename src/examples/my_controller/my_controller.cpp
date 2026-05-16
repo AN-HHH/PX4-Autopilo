@@ -5,6 +5,17 @@
 
 #include <cmath>
 
+namespace
+{
+// 本控制器的物理约定：负转速 / 反转 = 产生向上升力。
+// 如果以后又改回“正转速产生向上升力”，只需要把这里改成 1.f。
+static constexpr float kUpwardLiftSpinSign = -1.f;
+
+// actuator_motors[0] 和 actuator_motors[1] 允许输出负值。
+// 负值输出是否真正让电调反转，还取决于后端 UAVCAN / ESC 是否支持反转命令。
+static constexpr int kMotor01ReversibleFlags = (1 << 0) | (1 << 1);
+}
+
 MyController::MyController() :
 	ModuleParams(nullptr),
 	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::rate_ctrl)
@@ -63,15 +74,35 @@ void MyController::controllerStep(float tk, float dt,
 	R(2, 1) = cth * sphi;
 	R(2, 2) = cth * cphi;
 
+	/*
+	 * 注意：
+	 * 这里保持原来的相对转速关系 omega - r，不要改成 omega + r。
+	 *
+	 * omega1 / omega2 本身就是旋翼相对于机体的转速符号。
+	 * 现在我们规定负 omega 产生向上升力，所以只需要让 omega 命令为负。
+	 * 机体自旋角速度 r 的坐标定义没有变，因此相对转速仍然是 omega - r。
+	 */
 	const float weff1 = omega1 - r;
 	const float weff2 = omega2 - r;
 
-	const float T1 = _b * weff1 * fabsf(weff1);
-	const float T2 = _b * weff2 * fabsf(weff2);
+	/*
+	 * 原模型：T = _b * weff * |weff|，表示正转速产生正升力。
+	 * 现在物理约定改为：负转速 / 反转产生正升力。
+	 *
+	 * kUpwardLiftSpinSign = -1，因此：
+	 * weff < 0 时，T = -_b * weff * |weff| > 0。
+	 */
+	const float T1 = kUpwardLiftSpinSign * _b * weff1 * fabsf(weff1);
+	const float T2 = kUpwardLiftSpinSign * _b * weff2 * fabsf(weff2);
 	const float u1 = T1 + T2;
 
 	const matrix::Vector3f b3 = R * matrix::Vector3f(0.f, 0.f, 1.f);
 
+	/*
+	 * 偏航反扭矩不用额外手动反号。
+	 * 因为 weff 已经是带符号转速：
+	 * weff 为负时，weff * |weff| 自然为负，偏航反扭矩方向自然反过来。
+	 */
 	const float tau_z_est = _kq * (weff1 * fabsf(weff1) + weff2 * fabsf(weff2));
 	const float r_dot_est = ((_Jx - _Jy) * p * q + tau_z_est - yawDrag(r)) / _Jz;
 
@@ -124,6 +155,10 @@ void MyController::controllerStep(float tk, float dt,
 	const float p_d_dot = (Np_dot * c3_safe - Np * c3_dot) / (c3_safe * c3_safe);
 	const float q_d_dot = (Nq_dot * c3_safe - Nq * c3_dot) / (c3_safe * c3_safe);
 
+	/*
+	 * 陀螺耦合项保持原公式。
+	 * 因为 omega1 / omega2 已经是负值，反转带来的符号变化会自然进入公式。
+	 */
 	const float f_p = (_Jy - _Jz) * q * r - _Jr * (omega1 + omega2) * q;
 	const float f_q = (_Jz - _Jx) * p * r + _Jr * (omega1 + omega2) * p;
 
@@ -166,8 +201,9 @@ void MyController::controllerStep(float tk, float dt,
 	const float e_u = u1 - u1_ref;
 	const float u1_cmd_unsat = u1_ref - _k_up * e_u - _k_ui * xc.eta_u;
 
-	const float gain_spin = 1.f - expf(-math::max(tk - _t_spinup, 0.f) / 0.8f);
-	const float delta_raw = gain_spin * (xc.alpha_cf * cosf(psi) + xc.alpha_sf * sinf(psi));
+	// const float gain_spin = 1.f - expf(-math::max(tk - _t_spinup, 0.f) / 0.8f);
+	// const float delta_raw = gain_spin * (xc.alpha_cf * cosf(psi) + xc.alpha_sf * sinf(psi));
+	const float delta_raw = (xc.alpha_cf * cosf(psi) + xc.alpha_sf * sinf(psi));
 
 	const float u1_cmd_min = fabsf(delta_raw) + _u1_min_margin;
 
@@ -180,14 +216,27 @@ void MyController::controllerStep(float tk, float dt,
 	const float delta_max = math::max(u1_cmd - 1e-6f, 0.f);
 	const float delta = math::constrain(delta_raw, -delta_max, delta_max);
 
-	const float T1_cmd = math::max((u1_cmd + delta) * 0.5f, 0.f);
-	const float T2_cmd = math::max((u1_cmd - delta) * 0.5f, 0.f);
+	const float T1_cmd = math::max((u1_cmd - delta) * 0.5f, 0.f);
+	const float T2_cmd = math::max((u1_cmd + delta) * 0.5f, 0.f);
 
-	const float weff1_cmd = sqrtf(math::max(T1_cmd / _b, 0.f));
-	const float weff2_cmd = sqrtf(math::max(T2_cmd / _b, 0.f));
+	// const float T1_cmd = math::max((u1_cmd) * 0.5f, 0.f);
+	// const float T2_cmd = math::max((u1_cmd) * 0.5f, 0.f);
 
-	out.omega1_cmd = math::constrain(r + weff1_cmd, 0.f, _omega_max);
-	out.omega2_cmd = math::constrain(r + weff2_cmd, 0.f, _omega_max);
+	/*
+	 * 正升力命令 T_cmd > 0 对应负的等效转速命令。
+	 * 这里不能再生成正 sqrt，而是生成 -sqrt。
+	 */
+	const float weff1_cmd = kUpwardLiftSpinSign * sqrtf(math::max(T1_cmd / _b, 0.f));
+	const float weff2_cmd = kUpwardLiftSpinSign * sqrtf(math::max(T2_cmd / _b, 0.f));
+
+	/*
+	 * 保留原来的“转速限幅”逻辑，但把范围从 [0, _omega_max]
+	 * 改成 [-_omega_max, 0]。
+	 *
+	 * 这样飞机工作时旋翼必须为负数，0 表示停转。
+	 */
+	out.omega1_cmd = math::constrain(weff1_cmd+r, -_omega_max, 0.f);
+	out.omega2_cmd = math::constrain(weff2_cmd+r, -_omega_max, 0.f);
 
 	out.T1_cmd = T1_cmd;
 	out.T2_cmd = T2_cmd;
@@ -232,21 +281,33 @@ void MyController::Run()
 		const float rpm1 = static_cast<float>(esc_status.esc[0].esc_rpm);
 		const float rpm2 = static_cast<float>(esc_status.esc[1].esc_rpm);
 
-		if (PX4_ISFINITE(rpm1) && rpm1 > 1.f) {
-			_motor1_rpm_meas = rpm1;
+		/*
+		 * 反馈转速也统一到本控制器的符号约定：
+		 * 负 RPM = 反转 = 向上升力。
+		 *
+		 * 有些电调反转时仍然只反馈正的 RPM 幅值，
+		 * 所以这里使用 -fabsf(...)，保证控制器内部看到的是负转速。
+		 */
+		if (PX4_ISFINITE(rpm1) && fabsf(rpm1) > 1.f) {
+			_motor1_rpm_meas = kUpwardLiftSpinSign * fabsf(rpm1);
 		}
 
-		if (PX4_ISFINITE(rpm2) && rpm2 > 1.f) {
-			_motor2_rpm_meas = rpm2;
+		if (PX4_ISFINITE(rpm2) && fabsf(rpm2) > 1.f) {
+			_motor2_rpm_meas = kUpwardLiftSpinSign * fabsf(rpm2);
 		}
 	}
 
 	if (_rpm_sub.updated()) {
 		_rpm_sub.copy(&_rpm);
 
-		if (PX4_ISFINITE(_rpm.rpm_estimate) && _rpm.rpm_estimate > 1.f) {
+		if (PX4_ISFINITE(_rpm.rpm_estimate) && fabsf(_rpm.rpm_estimate) > 1.f) {
+			const float rpm_estimate_reverse = kUpwardLiftSpinSign * fabsf(_rpm.rpm_estimate);
+
 			if (!PX4_ISFINITE(_motor1_rpm_meas)) {
-				_motor1_rpm_meas = _rpm.rpm_estimate;
+				_motor1_rpm_meas = rpm_estimate_reverse;
+			}
+			if (!PX4_ISFINITE(_motor2_rpm_meas)) {
+				_motor2_rpm_meas = rpm_estimate_reverse;
 			}
 		}
 	}
@@ -272,6 +333,8 @@ void MyController::Run()
 		_last_omega1_cmd = 0.f;
 		_last_omega2_cmd = 0.f;
 
+		_attitude_disarm_sent = false;
+
 		actuator_motors_s motors{};
 		motors.timestamp = now_us;
 		motors.timestamp_sample = now_us;
@@ -288,15 +351,74 @@ void MyController::Run()
 	matrix::Quatf q_att(_att.q);
 	const matrix::Eulerf euler(q_att);
 
+	// 滚转角 / 俯仰角超过 20 度时，立即 disarm 并停止两个电机
+	const float attitude_disarm_limit_rad = 20.0f * M_PI_F / 180.0f;
+
+	const float roll_abs = fabsf(euler.phi());
+	const float pitch_abs = fabsf(euler.theta());
+
+	if ((roll_abs > attitude_disarm_limit_rad) || (pitch_abs > attitude_disarm_limit_rad)) {
+
+		if (!_attitude_disarm_sent) {
+			vehicle_command_s vcmd{};
+			vcmd.timestamp = now_us;
+
+			// MAV_CMD_COMPONENT_ARM_DISARM
+			// param1 = 0 表示 disarm
+			vcmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+			vcmd.param1 = 0.0f;
+			vcmd.param2 = 0.0f;
+
+			vcmd.target_system = 1;
+			vcmd.target_component = 1;
+			vcmd.source_system = 1;
+			vcmd.source_component = 1;
+			vcmd.from_external = false;
+
+			_vehicle_command_pub.publish(vcmd);
+
+		//	_attitude_disarm_sent = true;
+
+			PX4_WARN("attitude limit exceeded: roll=%.1f deg pitch=%.1f deg, disarm",
+				(double)(euler.phi() * 180.0f / M_PI_F),
+				(double)(euler.theta() * 180.0f / M_PI_F));
+		}
+
+		// 立即清零控制器内部状态
+		_xc.alpha_cf = 0.f;
+		_xc.alpha_sf = 0.f;
+		_xc.eta_u = 0.f;
+
+		_last_omega1_cmd = 0.f;
+		_last_omega2_cmd = 0.f;
+
+		// 立即停止本模块发给两个电机的输出
+		actuator_motors_s motors{};
+		motors.timestamp = now_us;
+		motors.timestamp_sample = now_us;
+		motors.reversible_flags = 0;
+
+		for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; i++) {
+			motors.control[i] = NAN;
+		}
+
+		motors.control[0] = 0.f;
+		motors.control[1] = 0.f;
+
+		_actuator_motors_pub.publish(motors);
+
+		return;
+	}
+
 	const float p = _ang_vel.xyz[0];
 	const float q = _ang_vel.xyz[1];
 	const float r = _ang_vel.xyz[2];
 
 	const bool rpm1_valid =
-		PX4_ISFINITE(_motor1_rpm_meas) && (_motor1_rpm_meas >= _min_rpm_for_feedback);
+		PX4_ISFINITE(_motor1_rpm_meas) && (fabsf(_motor1_rpm_meas) >= _min_rpm_for_feedback);
 
 	const bool rpm2_valid =
-		PX4_ISFINITE(_motor2_rpm_meas) && (_motor2_rpm_meas >= _min_rpm_for_feedback);
+		PX4_ISFINITE(_motor2_rpm_meas) && (fabsf(_motor2_rpm_meas) >= _min_rpm_for_feedback);
 
 	PlantState xp{};
 	xp.phi = euler.phi();
@@ -314,8 +436,8 @@ void MyController::Run()
 
 	if (_manual.valid) {
 		// 左侧摇杆二维位置 -> 合力方向
-		// 默认用 manual.roll / manual.pitch。
-		// 若你的物理左摇杆不是 roll/pitch，需要在 QGC Radio Setup 中重新映射。
+		// 默认用 manual.yaw / manual.pitch。
+		// 若你的物理左摇杆不是 yaw/pitch，需要在 QGC Radio Setup 中重新映射。
 		const float stick_x = math::constrain(_manual.yaw, -1.f, 1.f);
 		const float stick_y = math::constrain(_manual.pitch, -1.f, 1.f);
 
@@ -378,25 +500,29 @@ void MyController::Run()
 	ControllerOutput ctrl_out{};
 	controllerStep(tk, dt, xp, cmd, _xc, ctrl_out);
 
-	const float omega1_cmd = math::constrain(ctrl_out.omega1_cmd, 0.f, _omega_max);
-	const float omega2_cmd = math::constrain(ctrl_out.omega2_cmd, 0.f, _omega_max);
+	// 保留转速限幅逻辑，但改为负转速升力模式。
+	const float omega1_cmd = math::constrain(ctrl_out.omega1_cmd, -_omega_max, 0.f);
+	const float omega2_cmd = math::constrain(ctrl_out.omega2_cmd, -_omega_max, 0.f);
 
 	_last_omega1_cmd = omega1_cmd;
 	_last_omega2_cmd = omega2_cmd;
 
-	// actuator_motors 语义是归一化推力，不是归一化转速
-	const float single_motor_thrust_max = 0.5f * _u1_max_factor * _m * _g;
-
+	// actuator_motors 语义是归一化控制量。
+	// 这里你的电调链路将其理解为归一化转速命令：
+	// -1 ~ 0 表示反转到停转；负值产生向上升力。
 	const float motor1_norm =
-		math::constrain(ctrl_out.T1_cmd / single_motor_thrust_max, 0.f, 1.f);
+		math::constrain(omega1_cmd / _omega_max, -1.f, 0.f);
 
 	const float motor2_norm =
-		math::constrain(ctrl_out.T2_cmd / single_motor_thrust_max, 0.f, 1.f);
+		math::constrain(omega2_cmd / _omega_max, -1.f, 0.f);
 
 	actuator_motors_s motors{};
 	motors.timestamp = now_us;
 	motors.timestamp_sample = now_us;
-	motors.reversible_flags = 0;
+
+	// 关键：允许前两个电机输出负值。
+	static_assert(kMotor01ReversibleFlags == 0x0003, "Motor0 and Motor1 reversible flags should be 0x0003");
+	motors.reversible_flags = kMotor01ReversibleFlags;
 
 	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; i++) {
 		motors.control[i] = NAN;
@@ -404,14 +530,14 @@ void MyController::Run()
 
 	motors.control[0] = motor1_norm;
 	motors.control[1] = motor2_norm;
+	// motors.control[0] = 1;
+	// motors.control[1] = 1;
 
 	_actuator_motors_pub.publish(motors);
 
-	//发布控制器内部数据
+	// 发布控制器内部数据
 	my_controller_status_s st{};
 	st.timestamp = now_us;
-
-
 
 	st.phi = xp.phi;
 	st.theta = xp.theta;
@@ -437,7 +563,6 @@ void MyController::Run()
 	st.zd_ddot_z = cmd.zd_ddot_cmd_E(2);
 
 	st.u1_ref = cmd.u1_ref;
-
 
 	st.alpha_cf = _xc.alpha_cf;
 	st.alpha_sf = _xc.alpha_sf;
@@ -511,11 +636,13 @@ int MyController::print_usage(const char *reason)
 Single-axis birotor controller.
 
 Manual mapping:
-- manual.roll / manual.pitch -> desired force direction
+- manual.yaw / manual.pitch -> desired force direction
 - manual.throttle -> total thrust magnitude, 0.5mg to 1.5mg
 
 Output:
-- publish actuator_motors[0:1] as normalized thrust commands
+- publish actuator_motors[0:1] as negative normalized reverse-speed commands
+- negative motor command means reverse rotation
+- reverse rotation produces upward thrust
 )DESCR_STR");
 
 	PRINT_MODULE_USAGE_NAME("my_controller", "controller");

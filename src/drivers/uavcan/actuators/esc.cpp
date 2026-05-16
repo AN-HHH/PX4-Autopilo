@@ -46,6 +46,40 @@
 
 using namespace time_literals;
 
+static int16_t px4_output_to_dronecan_rawcommand(uint16_t output)
+{
+	static constexpr float PX4_OUT_MIN = 0.0f;
+	static constexpr float PX4_OUT_MAX = 8191.0f;
+
+	float u = ((float)output - PX4_OUT_MIN) * 2.0f / (PX4_OUT_MAX - PX4_OUT_MIN) - 1.0f;
+
+	if (u > 1.0f) {
+		u = 1.0f;
+	}
+
+	if (u < -1.0f) {
+		u = -1.0f;
+	}
+
+	int32_t cmd;
+
+	if (u >= 0.0f) {
+		cmd = (int32_t)lroundf(u * 8191.0f);
+	} else {
+		cmd = (int32_t)lroundf(u * 8192.0f);
+	}
+
+	if (cmd > 8191) {
+		cmd = 8191;
+	}
+
+	if (cmd < -8192) {
+		cmd = -8192;
+	}
+
+	return (int16_t)cmd;
+}
+
 UavcanEscController::UavcanEscController(uavcan::INode &node) :
 	_node(node),
 	_uavcan_pub_raw_cmd(node),
@@ -90,15 +124,24 @@ UavcanEscController::update_outputs(bool stop_motors, uint16_t outputs[MAX_ACTUA
 	 */
 	uavcan::equipment::esc::RawCommand msg;
 
+	// for (unsigned i = 0; i < num_outputs; i++) {
+	// 	if (stop_motors || outputs[i] == DISARMED_OUTPUT_VALUE) {
+	// 		msg.cmd.push_back(static_cast<unsigned>(0));
+
+	// 	} else {
+	// 		msg.cmd.push_back(static_cast<int>(outputs[i]));
+	// 	}
+	// }
+
 	for (unsigned i = 0; i < num_outputs; i++) {
 		if (stop_motors || outputs[i] == DISARMED_OUTPUT_VALUE) {
-			msg.cmd.push_back(static_cast<unsigned>(0));
+			msg.cmd.push_back(0);
 
 		} else {
-			msg.cmd.push_back(static_cast<int>(outputs[i]));
+			const int16_t cmd = px4_output_to_dronecan_rawcommand(outputs[i]);
+			msg.cmd.push_back(static_cast<int>(cmd));
 		}
 	}
-
 	/*
 	 * Remove channels that are always zero.
 	 * The objective of this optimization is to avoid broadcasting multi-frame transfers when a single frame
